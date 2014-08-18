@@ -1,17 +1,38 @@
-import gevent
-
-try:
-    import pywinusb.hid as hid
-
-    windows = True
-except:
-    windows = False
-
-import os
-from gevent.queue import Queue
+# Standard python imports
+import os, platform
 from subprocess import check_output
+
+# gevent and pycrypto must be installed
+import gevent
+from gevent.queue import Queue
 from Crypto.Cipher import AES
 from Crypto import Random
+
+# USB communication method depends on the system
+system = platform.system()
+if system == "Windows":
+    # For windows, install pywinusb
+    import pywinusb.hid as hid
+elif system == "Darwin":
+    # For mac, install cython-hidapi
+    import hid
+else:
+    # For linux, install pyusb
+    import usb.core
+
+"""
+A little more information about the USB requirements:
+
+In many applications, PyUSB is all that is needed for USB communication.  PyUSB uses libusb as its lower-level access to
+connected USB devices, and libusb works well for many devices except Humand Interface Devices (HIDs).  The Emotiv USB
+dongle is an HID.  As such, connecting to it with PyUSB can be problematic.  The alternative is to use an HID-friendly
+library rather than PyUSB.  For this reason, the Windows-specific pywinusb, which includes a module specifically for HID
+communcation, must be installed on Windows.  Macs do not have a system-specific HID module, but there is a Cython wrapper
+available for the C-level HID API.  This project is called cython-hidapi, and while it does not have as many features as
+the other, more common USB libraries, it does appear to make connecting with Emotiv's dongle possible on Macs.  Linux
+does not seem to suffer from the HID problems that other systems do, since all connected devices may be accessed through
+the /dev/ directory.  On Linux, just installing PyUSB is sufficient.
+"""
 
 sensorBits = {
     'F3': [10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7],
@@ -317,7 +338,7 @@ class EmotivPacket(object):
             )
 
 class Emotiv(object):
-    def __init__(self, displayOutput=False, headsetId=0, research_headset=True):
+    def __init__(self, displayOutput=False, headsetId=0, research_headset=True, serialNumber=None):
         self._goOn = True
         self.packets = Queue()
         self.packetsReceived = 0
@@ -326,6 +347,7 @@ class Emotiv(object):
         self.displayOutput = displayOutput
         self.headsetId = headsetId
         self.research_headset = research_headset
+	self.serialNum = serialNumber
         self.sensors = {
             'F3': {'value': 0, 'quality': 0},
             'FC6': {'value': 0, 'quality': 0},
@@ -347,58 +369,13 @@ class Emotiv(object):
         }
 
     def setup(self, headsetId=0):
-        if windows:
+        global system
+        if system == "Windows":
             self.setupWin()
+        elif system == "Darwin":
+            self.setupMac()
         else:
-            self.setupPosix()
-
-    def updateStdout(self):
-        while self._goOn:
-            if self.displayOutput:
-                if windows:
-                    os.system('cls')
-                else:
-                    os.system('clear')
-                print "Packets Received: %s Packets Processed: %s" % (self.packetsReceived, self.packetsProcessed)
-                print('\n'.join("%s Reading: %s Strength: %s" % (k[1], self.sensors[k[1]]['value'],self.sensors[k[1]]['quality']) for k in enumerate(self.sensors)))
-                print "Battery: %i" % g_battery
-            gevent.sleep(1)
-
-    def getLinuxSetup(self):
-        rawinputs = []
-        for filename in os.listdir("/sys/class/hidraw"):
-            realInputPath = check_output(["realpath", "/sys/class/hidraw/" + filename])
-            sPaths = realInputPath.split('/')
-            s = len(sPaths)
-            s = s - 4
-            i = 0
-            path = ""
-            while s > i:
-                path = path + sPaths[i] + "/"
-                i += 1
-            rawinputs.append([path, filename])
-        hiddevices = []
-        # TODO: Add support for multiple USB sticks? make a bit more elegant
-        for input in rawinputs:
-            try:
-                with open(input[0] + "/manufacturer", 'r') as f:
-                    manufacturer = f.readline()
-                    f.close()
-                if ("Emotiv Systems Inc." in manufacturer) or ("Emotiv Systems Pty Ltd" in manufacturer) :
-                    with open(input[0] + "/serial", 'r') as f:
-                        serial = f.readline().strip()
-                        f.close()
-                    print "Serial: " + serial + " Device: " + input[1]
-                    # Great we found it. But we need to use the second one...
-                    hidraw = input[1]
-                    id_hidraw = int(hidraw[-1])
-                    # The dev headset might use the first device, or maybe if more than one are connected they might.
-                    id_hidraw += 1
-                    hidraw = "hidraw" + id_hidraw.__str__()
-                    print "Serial: " + serial + " Device: " + hidraw + " (Active)"
-                    return [serial, hidraw, ]
-            except IOError as e:
-                print "Couldn't open file: %s" % e
+            self.setupDefault()
 
     def setupWin(self):
         devices = []
@@ -439,13 +416,39 @@ class Emotiv(object):
             for device in devices:
                 device.close()
 
-    def handler(self, data):
-        assert data[0] == 0
-        tasks.put_nowait(''.join(map(chr, data[1:])))
-        self.packetsReceived += 1
+    def setupMac(self):
+        self.hidraw = None
+        for device in hid.enumerate(0,0):
+            if 'Emotiv' in str(device['manufacturer_string']).replace('\x00',''):
+                self.hidraw = hid.device(device['vendor_id'], device['product_id'])
+                break
+        if self.hidraw == None:
+            return False
+        # A bug in cython-hidapi prevents getting the serial number automatically
+	# The code is in place to work correctly, should the bug be fixed
+	# For now, just instantiate the headset with the serial number so it will be applied here
+	if self.serialNum == None:
+		self.serialNum = device['serial_number']
+        gevent.spawn(self.setupCrypto, self.serialNum)
+        gevent.spawn(self.updateStdout)
+        while self._goOn:
+            try:
+                data = self.hidraw.read(32)
+                if data != "":
+                    data = [chr(x) for x in data]
+                    data = ''.join(data)
+                    if _os_decryption:
+                        self.packets.put_nowait(EmotivPacket(data))
+                    else:
+                        # Queue it!
+                        self.packetsReceived += 1
+                        tasks.put_nowait(data)
+                        gevent.sleep(0)
+            except KeyboardInterrupt:
+                self._goOn = False
         return True
 
-    def setupPosix(self):
+    def setupDefault(self):
         _os_decryption = False
         if os.path.exists('/dev/eeg/raw'):
             # The decrpytion is handled by the Linux epoc daemon. We don't need to handle it there.
@@ -474,6 +477,42 @@ class Emotiv(object):
             except KeyboardInterrupt:
                 self._goOn = False
         return True
+
+    def getLinuxSetup(self):
+        rawinputs = []
+        for filename in os.listdir("/sys/class/hidraw"):
+            realInputPath = check_output(["realpath", "/sys/class/hidraw/" + filename])
+            sPaths = realInputPath.split('/')
+            s = len(sPaths)
+            s = s - 4
+            i = 0
+            path = ""
+            while s > i:
+                path = path + sPaths[i] + "/"
+                i += 1
+            rawinputs.append([path, filename])
+        hiddevices = []
+        # TODO: Add support for multiple USB sticks? make a bit more elegant
+        for input in rawinputs:
+            try:
+                with open(input[0] + "/manufacturer", 'r') as f:
+                    manufacturer = f.readline()
+                    f.close()
+                if ("Emotiv Systems Inc." in manufacturer) or ("Emotiv Systems Pty Ltd" in manufacturer) :
+                    with open(input[0] + "/serial", 'r') as f:
+                        serial = f.readline().strip()
+                        f.close()
+                    print "Serial: " + serial + " Device: " + input[1]
+                    # Great we found it. But we need to use the second one...
+                    hidraw = input[1]
+                    id_hidraw = int(hidraw[-1])
+                    # The dev headset might use the first device, or maybe if more than one are connected they might.
+                    id_hidraw += 1
+                    hidraw = "hidraw" + id_hidraw.__str__()
+                    print "Serial: " + serial + " Device: " + hidraw + " (Active)"
+                    return [serial, hidraw, ]
+            except IOError as e:
+                print "Couldn't open file: %s" % e
 
     def setupCrypto(self, sn):
         type = 0 # feature[5]
@@ -524,6 +563,25 @@ class Emotiv(object):
                 gevent.sleep(0)
             gevent.sleep(0)
 
+    def updateStdout(self):
+        global system
+        while self._goOn:
+            if self.displayOutput:
+                if system == "Windows":
+                    os.system('cls')
+                else:
+                    os.system('clear')
+                print "Packets Received: %s Packets Processed: %s" % (self.packetsReceived, self.packetsProcessed)
+                print('\n'.join("%s Reading: %s Strength: %s" % (k[1], self.sensors[k[1]]['value'],self.sensors[k[1]]['quality']) for k in enumerate(self.sensors)))
+                print "Battery: %i" % g_battery
+            gevent.sleep(1)
+
+    def handler(self, data):
+        assert data[0] == 0
+        tasks.put_nowait(''.join(map(chr, data[1:])))
+        self.packetsReceived += 1
+        return True
+
     def dequeue(self):
         try:
             return self.packets.get()
@@ -531,7 +589,8 @@ class Emotiv(object):
             print e
 
     def close(self):
-        if windows:
+        global system
+        if system == "Windows":
             self.device.close()
         else:
             self._goOn = False
@@ -544,5 +603,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         a.close()
         gevent.shutdown()
-
-
