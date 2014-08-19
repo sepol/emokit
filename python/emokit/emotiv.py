@@ -195,6 +195,7 @@ class EmotivPacket(object):
             sensors[name]['value'] = value
         self.handle_quality(sensors)
         self.sensors = sensors
+        self.sensorNames = ['F3','FC5','AF3','F7','T7','P7','O1','O2','P8','T8','F8','AF4','FC6','F4']
 
     def get_level(self, data, bits):
         level = 0
@@ -337,6 +338,14 @@ class EmotivPacket(object):
             self.F3[0],
             )
 
+    def get_data(self):
+        data = [getattr(self, x)[0] for x in self.sensorNames]
+        data.insert(0, self.gyroY)
+        data.insert(0, self.gyroX)
+        data.insert(0, self.battery)
+        data.insert(0, self.counter)
+        return data
+
 class Emotiv(object):
     def __init__(self, displayOutput=False, headsetId=0, research_headset=True, serialNumber=None):
         self._goOn = True
@@ -437,13 +446,9 @@ class Emotiv(object):
                 if data != "":
                     data = [chr(x) for x in data]
                     data = ''.join(data)
-                    if _os_decryption:
-                        self.packets.put_nowait(EmotivPacket(data))
-                    else:
-                        # Queue it!
-                        self.packetsReceived += 1
-                        tasks.put_nowait(data)
-                        gevent.sleep(0)
+                    self.packetsReceived += 1
+                    tasks.put_nowait(data)
+                    gevent.sleep(0)
             except KeyboardInterrupt:
                 self._goOn = False
         return True
